@@ -15,12 +15,13 @@ import org.junit.Test
  */
 class ImeTextWriterTest {
 
-    private class FakeEditor(text: String = "") : EditorConnection {
+    private class FakeEditor(text: String = "", private val maxLength: Int = Int.MAX_VALUE) : EditorConnection {
         private val buf = StringBuilder(text)
         var cursor = text.length
         var composing: IntRange? = null
         var batchDepth = 0
         var nullTextBefore = false
+        var acceptsComposing = true
         val calls = mutableListOf<String>()
 
         val text: String get() = buf.toString()
@@ -31,8 +32,12 @@ class ImeTextWriterTest {
 
         override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
             calls += "setComposingText($text)"
-            val start = replaceComposingOrInsert(text)
-            composing = start until start + text.length
+            if (!acceptsComposing) return false
+            val replacedLength = composing?.let { it.last + 1 - it.first } ?: 0
+            val available = (maxLength - (buf.length - replacedLength)).coerceAtLeast(0)
+            val accepted = text.take(available)
+            val start = replaceComposingOrInsert(accepted)
+            composing = start until start + accepted.length
             return true
         }
 
@@ -75,6 +80,60 @@ class ImeTextWriterTest {
             buf.replace(start, end, text.toString())
             cursor = start + text.length
             return start
+        }
+    }
+
+    /** Queues batched edits; observing a blank value invalidates this simulated connection. */
+    private class ReactiveEditor(private val delegate: FakeEditor) : EditorConnection by delegate {
+        private var batchDepth = 0
+        private val pending = mutableListOf<() -> Unit>()
+        val publishedTexts = mutableListOf<String>()
+        var active = true
+            private set
+
+        private fun publish() {
+            publishedTexts += delegate.text
+            if (delegate.text.isBlank()) active = false
+        }
+
+        private fun edit(operation: () -> Unit): Boolean {
+            if (!active) return false
+            if (batchDepth > 0) {
+                pending += operation
+            } else {
+                operation()
+                publish()
+            }
+            return true
+        }
+
+        override fun setComposingText(text: CharSequence, newCursorPosition: Int) =
+            edit { delegate.setComposingText(text, newCursorPosition) }
+        override fun finishComposingText() = edit { delegate.finishComposingText() }
+        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int) =
+            edit { delegate.deleteSurroundingText(beforeLength, afterLength) }
+        override fun commitText(text: CharSequence, newCursorPosition: Int) =
+            edit { delegate.commitText(text, newCursorPosition) }
+
+        override fun beginBatchEdit(): Boolean {
+            if (!active) return false
+            batchDepth++
+            return true
+        }
+
+        override fun endBatchEdit(): Boolean {
+            batchDepth--
+            if (batchDepth == 0 && pending.isNotEmpty()) {
+                pending.forEach { it() }
+                pending.clear()
+                publish()
+            }
+            return batchDepth > 0
+        }
+
+        fun closeConnection() {
+            pending.clear()
+            active = false
         }
     }
 
@@ -129,6 +188,78 @@ class ImeTextWriterTest {
         writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline)
         assertEquals("One.", editor.text)
         assertTrue("deleteSurroundingText(5)" in editor.calls)
+    }
+
+    @Test
+    fun `scratch that uses committed context when the editor truncates partials`() {
+        val editor = FakeEditor("One. Two.", maxLength = 13)
+        val writer = writerFor(editor)
+        writer.showPartial("scratch")
+        writer.showPartial("scratch that")
+        assertEquals("One. Two. scr", editor.text)
+
+        assertTrue(writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline))
+        assertEquals("One.", editor.text)
+        assertNull(editor.composing)
+        assertEquals(0, editor.batchDepth)
+    }
+
+    @Test
+    fun `a rejected composing request does not freeze context or remove a nonexistent partial`() {
+        val editor = FakeEditor("One.").apply { acceptsComposing = false }
+        val writer = writerFor(editor)
+        writer.showPartial("hello")
+        editor.commitText(" Two.", 1)
+        editor.calls.clear()
+
+        assertTrue(writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline))
+        assertEquals("One.", editor.text)
+        assertFalse(editor.calls.any { it.startsWith("setComposingText") || it == "finishComposingText" })
+    }
+
+    @Test
+    fun `reactive editor rejects commits after an unbatched blank value`() {
+        val editor = ReactiveEditor(FakeEditor())
+        editor.setComposingText("hello", 1)
+        editor.setComposingText("", 1)
+
+        assertFalse(editor.active)
+        assertFalse(editor.commitText("Hello.", 1))
+        assertEquals(listOf("hello", ""), editor.publishedTexts)
+    }
+
+    @Test
+    fun `reactive editor observes the final before connection teardown without an intermediate blank`() {
+        for (initial in listOf("", "   ", "a", ".")) {
+            val buffer = FakeEditor(initial)
+            val editor = ReactiveEditor(buffer)
+            val writer = ImeTextWriter { editor }
+            writer.showPartial("hello")
+            val partial = buffer.text
+
+            assertTrue(writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline))
+            writer.clearPartial() // Session cleanup before switching keyboards.
+            assertTrue(editor.active)
+            editor.closeConnection()
+
+            val expected = initial + (if (initial.isNotEmpty() && !initial.last().isWhitespace()) " " else "") + "Hello."
+            assertEquals(expected, buffer.text)
+            assertEquals(listOf(partial, expected), editor.publishedTexts)
+            assertNull(buffer.composing)
+        }
+    }
+
+    @Test
+    fun `reactive editor applies scratch that with deferred composing removal`() {
+        val buffer = FakeEditor("One. Two.")
+        val editor = ReactiveEditor(buffer)
+        val writer = ImeTextWriter { editor }
+        writer.showPartial("scratch that")
+
+        assertTrue(writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline))
+        assertEquals("One.", buffer.text)
+        assertEquals(listOf("One. Two. scratch that", "One."), editor.publishedTexts)
+        assertNull(buffer.composing)
     }
 
     @Test

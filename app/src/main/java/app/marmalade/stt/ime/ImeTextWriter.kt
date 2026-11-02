@@ -60,8 +60,8 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
     /** A partial is in the editor's composing region. */
     private var composing = false
 
-    /** The exact text currently placed in the composing region (separator + partial). */
-    private var currentComposingText = ""
+    /** Context at the composing region's start, before the editor can filter or truncate a partial. */
+    private var beforeComposing = ""
 
     /** Goes before the partial ("" or " "), fixed when composing starts: afterwards the text before the cursor includes the partial. */
     private var separator = ""
@@ -75,11 +75,10 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         }
         val ed = editor() ?: return
         if (!composing) {
-            separator = Dictation.partialSeparator(ed.getTextBeforeCursor(1, 0)?.toString().orEmpty())
-            composing = true
+            beforeComposing = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
+            separator = Dictation.partialSeparator(beforeComposing)
         }
-        currentComposingText = separator + text
-        ed.setComposingText(currentComposingText, 1)
+        if (ed.setComposingText(separator + text, 1)) composing = true
     }
 
     /**
@@ -91,16 +90,16 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         val ed = editor()
         if (ed == null) {
             composing = false
-            currentComposingText = ""
+            beforeComposing = ""
             return false
         }
-        val rawBefore = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS + currentComposingText.length, 0)?.toString().orEmpty()
-        val before = if (composing && rawBefore.endsWith(currentComposingText)) {
-            rawBefore.dropLast(currentComposingText.length)
-        } else if (composing && rawBefore.length >= currentComposingText.length) {
-            rawBefore.dropLast(currentComposingText.length)
+        // Do not infer the composing region's length from the last partial: an
+        // editor may have filtered it. Reading after removal inside the batch
+        // is also unsafe: reactive editors can defer those edits until endBatchEdit.
+        val before = if (composing) {
+            beforeComposing
         } else {
-            rawBefore
+            ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
         }
         val edit = pipeline.process(text, before = before, nearSilent = nearSilent, silent = silent)
         ed.beginBatchEdit()
@@ -120,7 +119,7 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         val ed = editor()
         if (ed == null) {
             composing = false
-            currentComposingText = ""
+            beforeComposing = ""
             return
         }
         if (!composing) return
@@ -138,7 +137,7 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         ed.setComposingText("", 1)
         ed.finishComposingText()
         composing = false
-        currentComposingText = ""
+        beforeComposing = ""
     }
 
     private companion object {
