@@ -199,4 +199,60 @@ class ImeTextWriterTest {
         writer.commitFinal("hello", nearSilent = false, pipeline = pipeline)
         writer.clearPartial()
     }
+
+    @Test
+    fun `composing removal and commit occur inside a batch edit`() {
+        var batchDepthDuringRemove = -1
+        var batchDepthDuringCommit = -1
+        val editor = object : EditorConnection {
+            private val delegate = FakeEditor()
+            override fun getTextBeforeCursor(n: Int, flags: Int) = delegate.getTextBeforeCursor(n, flags)
+            override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
+                if (text.isEmpty()) batchDepthDuringRemove = delegate.batchDepth
+                return delegate.setComposingText(text, newCursorPosition)
+            }
+            override fun finishComposingText() = delegate.finishComposingText()
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int) =
+                delegate.deleteSurroundingText(beforeLength, afterLength)
+            override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
+                batchDepthDuringCommit = delegate.batchDepth
+                return delegate.commitText(text, newCursorPosition)
+            }
+            override fun beginBatchEdit() = delegate.beginBatchEdit()
+            override fun endBatchEdit() = delegate.endBatchEdit()
+        }
+        val writer = ImeTextWriter { editor }
+        writer.showPartial("hello")
+        writer.commitFinal("hello world", nearSilent = false, pipeline = pipeline)
+        assertEquals(1, batchDepthDuringRemove)
+        assertEquals(1, batchDepthDuringCommit)
+    }
+
+    @Test
+    fun `commitFinal in an empty field commits cleanly without leaving composing spans`() {
+        val editor = FakeEditor("")
+        val writer = writerFor(editor)
+        writer.showPartial("hello")
+        assertEquals("hello", editor.text)
+        assertEquals("hello", editor.composingText)
+
+        writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline)
+        assertEquals("Hello.", editor.text)
+        assertNull(editor.composing)
+        assertEquals(0, editor.batchDepth)
+    }
+
+    @Test
+    fun `commitFinal in a whitespace field commits cleanly`() {
+        val editor = FakeEditor("   ")
+        val writer = writerFor(editor)
+        writer.showPartial("hello")
+        assertEquals("   hello", editor.text)
+        assertEquals("hello", editor.composingText)
+
+        writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline)
+        assertEquals("   Hello.", editor.text)
+        assertNull(editor.composing)
+        assertEquals(0, editor.batchDepth)
+    }
 }

@@ -60,6 +60,9 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
     /** A partial is in the editor's composing region. */
     private var composing = false
 
+    /** The exact text currently placed in the composing region (separator + partial). */
+    private var currentComposingText = ""
+
     /** Goes before the partial ("" or " "), fixed when composing starts: afterwards the text before the cursor includes the partial. */
     private var separator = ""
 
@@ -75,7 +78,8 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
             separator = Dictation.partialSeparator(ed.getTextBeforeCursor(1, 0)?.toString().orEmpty())
             composing = true
         }
-        ed.setComposingText(separator + text, 1)
+        currentComposingText = separator + text
+        ed.setComposingText(currentComposingText, 1)
     }
 
     /**
@@ -87,14 +91,22 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         val ed = editor()
         if (ed == null) {
             composing = false
+            currentComposingText = ""
             return false
         }
-        removeComposing(ed)
-        val before = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
+        val rawBefore = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS + currentComposingText.length, 0)?.toString().orEmpty()
+        val before = if (composing && rawBefore.endsWith(currentComposingText)) {
+            rawBefore.dropLast(currentComposingText.length)
+        } else if (composing && rawBefore.length >= currentComposingText.length) {
+            rawBefore.dropLast(currentComposingText.length)
+        } else {
+            rawBefore
+        }
         val edit = pipeline.process(text, before = before, nearSilent = nearSilent, silent = silent)
-        if (edit.isEmpty) return false
         ed.beginBatchEdit()
         try {
+            removeComposing(ed)
+            if (edit.isEmpty) return false
             if (edit.deleteBefore > 0) ed.deleteSurroundingText(edit.deleteBefore, 0)
             if (edit.insert.isNotEmpty()) ed.commitText(edit.insert, 1)
         } finally {
@@ -108,9 +120,16 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         val ed = editor()
         if (ed == null) {
             composing = false
+            currentComposingText = ""
             return
         }
-        removeComposing(ed)
+        if (!composing) return
+        ed.beginBatchEdit()
+        try {
+            removeComposing(ed)
+        } finally {
+            ed.endBatchEdit()
+        }
     }
 
     private fun removeComposing(ed: EditorConnection) {
@@ -119,6 +138,7 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         ed.setComposingText("", 1)
         ed.finishComposingText()
         composing = false
+        currentComposingText = ""
     }
 
     private companion object {
