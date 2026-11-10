@@ -22,6 +22,11 @@ class ImeTextWriterTest {
         var batchDepth = 0
         var nullTextBefore = false
         var acceptsComposing = true
+        var acceptsCommit = true
+        var supportsBatch = true
+        var batchRequests = 0
+        var acceptsDeletion = true
+        val observedTexts = mutableListOf<String>()
         val calls = mutableListOf<String>()
 
         val text: String get() = buf.toString()
@@ -38,33 +43,40 @@ class ImeTextWriterTest {
             val accepted = text.take(available)
             val start = replaceComposingOrInsert(accepted)
             composing = start until start + accepted.length
+            observedTexts += this.text
             return true
         }
 
         override fun finishComposingText(): Boolean {
             calls += "finishComposingText"
             composing = null
+            observedTexts += this.text
             return true
         }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
             calls += "deleteSurroundingText($beforeLength)"
+            if (!acceptsDeletion) return false
             val start = maxOf(0, cursor - beforeLength)
             buf.delete(start, cursor)
             cursor = start
+            observedTexts += this.text
             return true
         }
 
         override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
             calls += "commitText($text)"
+            if (!acceptsCommit) return false
             replaceComposingOrInsert(text)
             composing = null
+            observedTexts += this.text
             return true
         }
 
         override fun beginBatchEdit(): Boolean {
+            batchRequests++
             batchDepth++
-            return true
+            return supportsBatch
         }
 
         override fun endBatchEdit(): Boolean {
@@ -83,8 +95,8 @@ class ImeTextWriterTest {
         }
     }
 
-    /** Queues batched edits; observing a blank value invalidates this simulated connection. */
-    private class ReactiveEditor(private val delegate: FakeEditor) : EditorConnection by delegate {
+    /** Models an editor that defers edits until the outermost batch ends. */
+    private class DeferredEditor(private val delegate: FakeEditor) : EditorConnection by delegate {
         private var batchDepth = 0
         private val pending = mutableListOf<() -> Unit>()
         val publishedTexts = mutableListOf<String>()
@@ -93,7 +105,6 @@ class ImeTextWriterTest {
 
         private fun publish() {
             publishedTexts += delegate.text
-            if (delegate.text.isBlank()) active = false
         }
 
         private fun edit(operation: () -> Unit): Boolean {
@@ -218,21 +229,10 @@ class ImeTextWriterTest {
     }
 
     @Test
-    fun `reactive editor rejects commits after an unbatched blank value`() {
-        val editor = ReactiveEditor(FakeEditor())
-        editor.setComposingText("hello", 1)
-        editor.setComposingText("", 1)
-
-        assertFalse(editor.active)
-        assertFalse(editor.commitText("Hello.", 1))
-        assertEquals(listOf("hello", ""), editor.publishedTexts)
-    }
-
-    @Test
-    fun `reactive editor observes the final before connection teardown without an intermediate blank`() {
+    fun `deferred editor applies the final before simulated connection teardown`() {
         for (initial in listOf("", "   ", "a", ".")) {
             val buffer = FakeEditor(initial)
-            val editor = ReactiveEditor(buffer)
+            val editor = DeferredEditor(buffer)
             val writer = ImeTextWriter { editor }
             writer.showPartial("hello")
             val partial = buffer.text
@@ -250,9 +250,9 @@ class ImeTextWriterTest {
     }
 
     @Test
-    fun `reactive editor applies scratch that with deferred composing removal`() {
+    fun `deferred editor applies scratch that with deferred composing removal`() {
         val buffer = FakeEditor("One. Two.")
-        val editor = ReactiveEditor(buffer)
+        val editor = DeferredEditor(buffer)
         val writer = ImeTextWriter { editor }
         writer.showPartial("scratch that")
 
@@ -332,31 +332,110 @@ class ImeTextWriterTest {
     }
 
     @Test
-    fun `composing removal and commit occur inside a batch edit`() {
-        var batchDepthDuringRemove = -1
-        var batchDepthDuringCommit = -1
-        val editor = object : EditorConnection {
-            private val delegate = FakeEditor()
-            override fun getTextBeforeCursor(n: Int, flags: Int) = delegate.getTextBeforeCursor(n, flags)
-            override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
-                if (text.isEmpty()) batchDepthDuringRemove = delegate.batchDepth
-                return delegate.setComposingText(text, newCursorPosition)
-            }
-            override fun finishComposingText() = delegate.finishComposingText()
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int) =
-                delegate.deleteSurroundingText(beforeLength, afterLength)
-            override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
-                batchDepthDuringCommit = delegate.batchDepth
-                return delegate.commitText(text, newCursorPosition)
-            }
-            override fun beginBatchEdit() = delegate.beginBatchEdit()
-            override fun endBatchEdit() = delegate.endBatchEdit()
+    fun `ordinary final replaces composition without publishing an intermediate deletion`() {
+        // Observe EVERY edit, even within a batch. This does not assume the
+        // editor hides intermediate values or invalidates blank connections.
+        for (initial in listOf("", " ", "   ", "a", ".")) {
+            val editor = FakeEditor(initial)
+            val writer = writerFor(editor)
+            writer.showPartial("hello")
+            editor.calls.clear()
+            editor.observedTexts.clear()
+
+            assertTrue(writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline))
+            writer.clearPartial() // Session cleanup must not remove the final.
+
+            val expected = initial + (if (initial.isNotEmpty() && !initial.last().isWhitespace()) " " else "") + "Hello."
+            assertEquals(listOf(expected), editor.observedTexts)
+            assertEquals(listOf("commitText(${expected.removePrefix(initial)})"), editor.calls)
+            assertEquals(expected, editor.text)
+            assertNull(editor.composing)
+            assertEquals(0, editor.batchDepth)
         }
-        val writer = ImeTextWriter { editor }
+    }
+
+    @Test
+    fun `rejected final is reported and cleanup preserves the visible partial`() {
+        val editor = FakeEditor()
+        val writer = writerFor(editor)
+        val failures = mutableListOf<String>()
+        writer.onEditorFailure = { failures += it }
         writer.showPartial("hello")
-        writer.commitFinal("hello world", nearSilent = false, pipeline = pipeline)
-        assertEquals(1, batchDepthDuringRemove)
-        assertEquals(1, batchDepthDuringCommit)
+        editor.acceptsCommit = false
+
+        assertFalse(writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline))
+        writer.clearPartial()
+
+        assertEquals("hello", editor.text)
+        assertNull(editor.composing)
+        assertEquals(listOf("commitText rejected"), failures)
+        assertEquals(0, editor.batchDepth)
+
+        // A later utterance starts with fresh context, rather than replacing
+        // the partial retained from the failed request.
+        editor.acceptsCommit = true
+        writer.showPartial("again")
+        assertTrue(writer.commitFinal("again", nearSilent = false, pipeline = pipeline))
+        assertEquals("hello again", editor.text)
+    }
+
+    @Test
+    fun `ordinary final needs no batch support`() {
+        val editor = FakeEditor().apply { supportsBatch = false }
+        val writer = writerFor(editor)
+        writer.showPartial("hello")
+        editor.calls.clear()
+
+        assertTrue(writer.commitFinal("Hello.", nearSilent = false, pipeline = pipeline))
+        writer.clearPartial()
+
+        assertEquals("Hello.", editor.text)
+        assertEquals(listOf("commitText(Hello.)"), editor.calls)
+        assertEquals(0, editor.batchRequests)
+        assertEquals(0, editor.batchDepth)
+    }
+
+    @Test
+    fun `commands work when batching is unsupported but edits are accepted`() {
+        val editor = FakeEditor("One. Two.").apply { supportsBatch = false }
+        val writer = writerFor(editor)
+        writer.showPartial("scratch that")
+
+        assertTrue(writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline))
+        assertEquals("One.", editor.text)
+        assertEquals(1, editor.batchRequests)
+        assertEquals(0, editor.batchDepth)
+    }
+
+    @Test
+    fun `rejected command deletion stops before inserting replacement text`() {
+        val editor = FakeEditor("Hello ")
+        val writer = writerFor(editor)
+        val punctuation = TextPipeline(TextProcConfig(spokenPunctuation = true))
+        writer.showPartial("comma")
+        editor.acceptsDeletion = false
+        editor.calls.clear()
+
+        assertFalse(writer.commitFinal("comma", nearSilent = false, pipeline = punctuation))
+        assertEquals("Hello ", editor.text)
+        assertFalse(editor.calls.any { it.startsWith("commitText") })
+        assertEquals(0, editor.batchDepth)
+    }
+
+    @Test
+    fun `rejected composing removal stops a command without deleting prior text`() {
+        val editor = FakeEditor("One. Two.")
+        val writer = writerFor(editor)
+        writer.showPartial("scratch that")
+        editor.acceptsComposing = false
+        editor.calls.clear()
+
+        assertFalse(writer.commitFinal("Scratch that.", nearSilent = false, pipeline = pipeline))
+        writer.clearPartial()
+        assertEquals("One. Two. scratch that", editor.text)
+        assertNull(editor.composing)
+        assertFalse(editor.calls.any { it.startsWith("deleteSurroundingText") })
+        assertEquals(0, editor.batchDepth)
     }
 
     @Test

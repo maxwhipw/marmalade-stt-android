@@ -134,7 +134,9 @@ class VoiceInputService :
      */
     private lateinit var appearance: StateFlow<Appearance?>
 
-    private val writer = ImeTextWriter { currentInputConnection?.asEditorConnection() }
+    private val writer = ImeTextWriter { currentInputConnection?.asEditorConnection() }.apply {
+        onEditorFailure = { operation -> Log.w(TAG, "Editor request failed: $operation") }
+    }
     private val _state = MutableStateFlow(VoiceImeState())
 
     /** The panel state without the level, so level updates don't recompose the text. */
@@ -229,6 +231,7 @@ class VoiceInputService :
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
+        Log.d(TAG, "Input view finishing; finishingInput=$finishingInput")
         abort()
         closeEngineHold()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
@@ -236,6 +239,7 @@ class VoiceInputService :
     }
 
     override fun onWindowHidden() {
+        Log.d(TAG, "Input window hidden")
         abort()
         closeEngineHold()
         // Hidden without Done or Cancel (Back, Home, the app closed the
@@ -279,6 +283,7 @@ class VoiceInputService :
     }
 
     private fun onDone() {
+        Log.d(TAG, "Done requested; sessionActive=${listenJob?.isActive == true}")
         if (listenJob?.isActive == true) stop(exitAfter = true) else switchBack()
     }
 
@@ -341,6 +346,7 @@ class VoiceInputService :
             is SttEvent.Final -> {
                 val startedAt = SystemClock.elapsedRealtime()
                 committed = writer.commitFinal(event.text, event.nearSilent, pipeline.get(), event.silent)
+                Log.d(TAG, "Final processed; editRequestsAccepted=$committed")
                 ListenTiming.delivered("keyboard", startedAt)
             }
             is SttEvent.NoSpeech, is SttEvent.Error -> writer.clearPartial()
@@ -371,6 +377,7 @@ class VoiceInputService :
     }
 
     private fun switchBack() {
+        Log.d(TAG, "Switching to previous input method")
         keepOnHide = true
         if (!switchToPreviousInputMethod()) requestHideSelf(0)
     }
