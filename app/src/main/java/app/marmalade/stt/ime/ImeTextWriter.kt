@@ -50,6 +50,9 @@ fun InputConnection.asEditorConnection(): EditorConnection {
  */
 class ImeTextWriter(private val editor: () -> EditorConnection?) {
 
+    /** Diagnostics contain operation names only, never dictated text. */
+    var onEditorFailure: (String) -> Unit = {}
+
     /**
      * Whether partials go into the editor at all. False for editors without
      * text support (`InputType.TYPE_NULL`), where a composing region makes no
@@ -59,6 +62,9 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
 
     /** A partial is in the editor's composing region. */
     private var composing = false
+
+    /** Context at the composing region's start, before the editor can filter or truncate a partial. */
+    private var beforeComposing = ""
 
     /** Goes before the partial ("" or " "), fixed when composing starts: afterwards the text before the cursor includes the partial. */
     private var separator = ""
@@ -72,31 +78,52 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
         }
         val ed = editor() ?: return
         if (!composing) {
-            separator = Dictation.partialSeparator(ed.getTextBeforeCursor(1, 0)?.toString().orEmpty())
-            composing = true
+            beforeComposing = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
+            separator = Dictation.partialSeparator(beforeComposing)
         }
-        ed.setComposingText(separator + text, 1)
+        if (ed.setComposingText(separator + text, 1)) composing = true
     }
 
     /**
      * Replace the partial with the cleaned-up [text] of a finished utterance.
-     * Returns whether it changed the editor (false when the cleanup left
-     * nothing, e.g. a filtered hallucination, or there is no editor).
+     * Returns whether the editor accepted the final edit requests. This is
+     * not an acknowledgment that the host app persisted the text.
      */
     fun commitFinal(text: String, nearSilent: Boolean, pipeline: TextPipeline, silent: Boolean = false): Boolean {
         val ed = editor()
         if (ed == null) {
-            composing = false
+            onEditorFailure("no input connection for final")
+            resetComposition()
             return false
         }
-        removeComposing(ed)
-        val before = ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
+        // Do not infer the composing region's length from the last partial: an
+        // editor may have filtered it. Reading after removal inside the batch
+        // is also unsafe: reactive editors can defer those edits until endBatchEdit.
+        val before = if (composing) {
+            beforeComposing
+        } else {
+            ed.getTextBeforeCursor(BEFORE_CURSOR_CHARS, 0)?.toString().orEmpty()
+        }
         val edit = pipeline.process(text, before = before, nearSilent = nearSilent, silent = silent)
-        if (edit.isEmpty) return false
+        if (!edit.isEmpty && edit.deleteBefore == 0) {
+            // commitText replaces the composing span itself. This single edit
+            // needs no batching and never exposes an intermediate blank value.
+            if (!ed.commitText(edit.insert, 1)) return rejectedFinal(ed, "commitText")
+            resetComposition()
+            return true
+        }
+        // Commands can reach into text preceding the composing span. Batching
+        // is advisory: BaseInputConnection can return false even when usable.
         ed.beginBatchEdit()
         try {
-            if (edit.deleteBefore > 0) ed.deleteSurroundingText(edit.deleteBefore, 0)
-            if (edit.insert.isNotEmpty()) ed.commitText(edit.insert, 1)
+            if (!removeComposing(ed)) return rejectedFinal(ed, "remove composing text")
+            if (edit.isEmpty) return false
+            if (!ed.deleteSurroundingText(edit.deleteBefore, 0)) {
+                return rejectedFinal(ed, "deleteSurroundingText")
+            }
+            if (edit.insert.isNotEmpty() && !ed.commitText(edit.insert, 1)) {
+                return rejectedFinal(ed, "commitText after deletion")
+            }
         } finally {
             ed.endBatchEdit()
         }
@@ -107,18 +134,39 @@ class ImeTextWriter(private val editor: () -> EditorConnection?) {
     fun clearPartial() {
         val ed = editor()
         if (ed == null) {
-            composing = false
+            resetComposition()
             return
         }
-        removeComposing(ed)
+        if (!composing) return
+        ed.beginBatchEdit()
+        try {
+            if (!removeComposing(ed)) rejectedFinal(ed, "clearPartial")
+        } finally {
+            ed.endBatchEdit()
+        }
     }
 
-    private fun removeComposing(ed: EditorConnection) {
-        if (!composing) return
+    private fun removeComposing(ed: EditorConnection): Boolean {
+        if (!composing) return true
         // Empty it first: finishComposingText alone would keep the partial as text.
-        ed.setComposingText("", 1)
-        ed.finishComposingText()
+        if (!ed.setComposingText("", 1)) return false
+        val finished = ed.finishComposingText()
+        resetComposition()
+        return finished
+    }
+
+    private fun rejectedFinal(ed: EditorConnection, operation: String): Boolean {
+        onEditorFailure("$operation rejected")
+        // Keep whatever partial is still visible. Session cleanup must not
+        // turn a failed final replacement into another destructive removal.
+        if (composing) ed.finishComposingText()
+        resetComposition()
+        return false
+    }
+
+    private fun resetComposition() {
         composing = false
+        beforeComposing = ""
     }
 
     private companion object {
